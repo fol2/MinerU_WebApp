@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF to Markdown Converter</title>
+    <style>
+        #drop-area {
+            border: 2px dashed #ccc;
+            border-radius: 20px;
+            width: 300px;
+            height: 200px;
+            font-family: sans-serif;
+            margin: 50px auto;
+            padding: 20px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div id="drop-area">
+        <h3>Drag and Drop PDF Here</h3>
+        <input type="file" id="fileElem" accept="application/pdf" style="display:none" onchange="handleFiles(this.files)">
+        <button id="fileSelect">Select a file</button>
+    </div>
+    <div id="progress"></div>
+    <div id="output"></div>
+
+    <script>
+        let dropArea = document.getElementById('drop-area');
+
+        dropArea.addEventListener('dragover', (event) => {
+            event.preventDefault();
+            dropArea.classList.add('highlight');
+        });
+
+        dropArea.addEventListener('dragleave', () => {
+            dropArea.classList.remove('highlight');
+        });
+
+        dropArea.addEventListener('drop', (event) => {
+            event.preventDefault();
+            dropArea.classList.remove('highlight');
+            let files = event.dataTransfer.files;
+            handleFiles(files);
+        });
+
+        document.getElementById('fileSelect').onclick = () => {
+            document.getElementById('fileElem').click();
+        };
+
+        function handleFiles(files) {
+            const file = files[0];
+            if (file) {
+                uploadFile(file);
+            }
+        }
+
+        function uploadFile(file) {
+            const url = '/upload';
+            const formData = new FormData();
+            formData.append('file', file);
+
+            fetch(url, {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('progress').innerText = `Error: ${data.error}`;
+                } else {
+                    document.getElementById('progress').innerText = 'Conversion successful!';
+                    const downloadLink = document.createElement('a');
+                    downloadLink.href = `/download/${data.markdown_path}`;
+                    downloadLink.innerText = 'Download Markdown';
+                    document.getElementById('output').appendChild(downloadLink);
+                }
+            })
+            .catch(error => {
+                document.getElementById('progress').innerText = `Error: ${error}`;
+            });
+        }
+    </script>
+</body>
+</html> 

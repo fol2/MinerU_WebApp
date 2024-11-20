@@ -1,5 +1,15 @@
 # Copyright (c) Opendatalab. All rights reserved.
 
+import warnings
+import os
+
+# Suppress the existing warnings
+warnings.filterwarnings("ignore", message="import tensorrt_llm failed")
+warnings.filterwarnings("ignore", message="import lmdeploy failed")
+
+# Suppress PaddlePaddle GPU warnings
+os.environ['FLAGS_call_stack_level'] = '0'  # Suppress PaddlePaddle warnings
+
 import base64
 import os
 import time
@@ -31,11 +41,112 @@ def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, layout_mode, formula_en
     try:
         file_name = f"{str(Path(doc_path).stem)}_{time.time()}"
         pdf_data = read_fn(doc_path)
-        if is_ocr:
+
+        # Determine parse method based on OCR and table settings
+        if is_ocr or table_enable:
             parse_method = "ocr"
+            try:
+                import rapidocr_onnxruntime
+                from rapidocr_onnxruntime import RapidOCR
+                logger.info("Initializing RapidOCR for table recognition")
+                ocr = RapidOCR()
+            except ImportError:
+                logger.error("rapidocr_onnxruntime not found")
+                raise ImportError("Table recognition requires rapidocr_onnxruntime")
         else:
             parse_method = "auto"
+
         local_image_dir, local_md_dir = prepare_env(output_dir, file_name, parse_method)
+
+        # Initialize models before parsing
+        if table_enable:
+            from magic_pdf.model.doc_analyze_by_custom_model import ModelSingleton
+            model_manager = ModelSingleton()
+            model = model_manager.get_model(True, True)
+            logger.info("Table recognition model initialized")
+
+            # Patch the table recognition module to use our OCR
+            from magic_pdf.model.sub_modules.table.rapidtable.rapid_table import RapidTableModel
+            def patched_predict(self, image):
+                try:
+                    import numpy as np
+                    
+                    # Ensure image is valid
+                    if image is None:
+                        logger.warning("Received None image")
+                        return None, None, 0
+
+                    # Run OCR
+                    try:
+                        result = ocr(image)
+                        logger.info(f"OCR result type: {type(result)}")
+                        logger.debug(f"OCR result: {result}")
+                        
+                        # Check if OCR failed (returns (None, None))
+                        if result == (None, None):
+                            logger.warning("OCR failed to detect any text in the image")
+                            # Try using the built-in OCR engine as fallback
+                            try:
+                                ocr_result, _ = self.ocr_engine(np.asarray(image))
+                                if ocr_result:
+                                    logger.info("Successfully used fallback OCR")
+                                    return self.table_model(np.asarray(image), ocr_result)
+                            except Exception as fallback_err:
+                                logger.error(f"Fallback OCR also failed: {str(fallback_err)}")
+                            return None, None, 0
+                            
+                    except Exception as ocr_err:
+                        logger.error(f"OCR failed: {str(ocr_err)}")
+                        return None, None, 0
+
+                    # Validate OCR result
+                    if result is None or not isinstance(result, tuple) or len(result) < 1:
+                        logger.warning("Invalid OCR result format")
+                        return None, None, 0
+
+                    boxes_list = result[0]  # Get the first element which contains the OCR results
+                    if not boxes_list:
+                        logger.warning("No text detected in image")
+                        return None, None, 0
+                        
+                    # Format OCR results for RapidTable
+                    ocr_result = []
+                    for item in boxes_list:
+                        try:
+                            box = item[0]  # box coordinates
+                            text = item[1]  # text
+                            confidence = item[2]  # confidence score
+                            
+                            # Convert box coordinates to integers
+                            box = [[int(float(x)), int(float(y))] for x, y in box]
+                            ocr_result.append([box, text, float(confidence)])
+                        except (IndexError, ValueError) as e:
+                            logger.debug(f"Skipping invalid OCR result item: {str(e)}")
+                            continue
+                    
+                    if ocr_result:
+                        logger.info(f"OCR found {len(ocr_result)} text regions")
+                        try:
+                            # Convert image to numpy array if it isn't already
+                            image_array = np.asarray(image)
+                            logger.debug(f"Image shape: {image_array.shape}")
+                            logger.debug(f"First OCR result: {ocr_result[0] if ocr_result else None}")
+                            
+                            return self.table_model(image_array, ocr_result)
+                        except Exception as table_err:
+                            logger.error(f"Table model failed: {str(table_err)}")
+                            logger.exception(table_err)
+                            return None, None, 0
+                    else:
+                        logger.warning("No valid OCR results found")
+                        return None, None, 0
+                    
+                except Exception as e:
+                    logger.exception(f"Table recognition failed: {str(e)}")
+                    return None, None, 0
+                    
+            RapidTableModel.predict = patched_predict
+
         do_parse(
             output_dir,
             file_name,
@@ -52,6 +163,7 @@ def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, layout_mode, formula_en
         return local_md_dir, file_name
     except Exception as e:
         logger.exception(e)
+        return None
 
 
 def compress_directory_to_zip(directory_path, output_zip_path):
@@ -100,23 +212,48 @@ def replace_image_with_base64(markdown_text, image_dir_path):
 
 
 def to_markdown(file_path, end_pages, is_ocr, layout_mode, formula_enable, table_enable, language):
-    # 获取识别的md文件以及压缩包文件路径
-    local_md_dir, file_name = parse_pdf(file_path, './output', end_pages - 1, is_ocr,
-                                        layout_mode, formula_enable, table_enable, language)
-    archive_zip_path = os.path.join("./output", compute_sha256(local_md_dir) + ".zip")
-    zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
-    if zip_archive_success == 0:
-        logger.info("压缩成功")
-    else:
-        logger.error("压缩失败")
-    md_path = os.path.join(local_md_dir, file_name + ".md")
-    with open(md_path, 'r', encoding='utf-8') as f:
-        txt_content = f.read()
-    md_content = replace_image_with_base64(txt_content, local_md_dir)
-    # 返回转换后的PDF路径
-    new_pdf_path = os.path.join(local_md_dir, file_name + "_layout.pdf")
+    try:
+        # Validate input file path
+        if not file_path or not os.path.exists(file_path):
+            raise ValueError("Invalid or missing PDF file")
 
-    return md_content, txt_content, archive_zip_path, new_pdf_path
+        # Convert float('inf') to -1 to indicate no page limit
+        end_page_id = -1 if end_pages == float('inf') else end_pages - 1
+        
+        # Get the recognized md file and compressed file path
+        result = parse_pdf(file_path, './output', end_page_id, is_ocr,
+                          layout_mode, formula_enable, table_enable, language)
+        
+        if result is None:
+            raise ValueError("PDF parsing failed")
+            
+        local_md_dir, file_name = result
+        
+        # Validate output directory
+        if not os.path.exists(local_md_dir):
+            raise ValueError("Output directory not created")
+            
+        archive_zip_path = os.path.join("./output", compute_sha256(local_md_dir) + ".zip")
+        zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
+        if zip_archive_success == 0:
+            logger.info("压缩成功")
+        else:
+            logger.error("压缩失败")
+            
+        md_path = os.path.join(local_md_dir, file_name + ".md")
+        if not os.path.exists(md_path):
+            raise ValueError("Markdown file not generated")
+            
+        with open(md_path, 'r', encoding='utf-8') as f:
+            txt_content = f.read()
+        md_content = replace_image_with_base64(txt_content, local_md_dir)
+        # 返回转换后的PDF路径
+        new_pdf_path = os.path.join(local_md_dir, file_name + "_layout.pdf")
+
+        return md_content, txt_content, archive_zip_path, new_pdf_path
+    except Exception as e:
+        logger.exception(e)
+        raise
 
 
 latex_delimiters = [{"left": "$$", "right": "$$", "display": True},
@@ -176,7 +313,7 @@ def to_pdf(file_path):
             # 生成唯一的文件名
             unique_filename = f"{uuid.uuid4()}.pdf"
 
-            # 构建完整的文件路径
+            # 构建完整的文件径
             tmp_file_path = os.path.join(os.path.dirname(file_path), unique_filename)
 
             # 将字节数据写入文件
@@ -187,12 +324,19 @@ def to_pdf(file_path):
 
 
 if __name__ == "__main__":
+    # Create output directory if it doesn't exist
+    os.makedirs("./output", exist_ok=True)
+    
     with gr.Blocks() as demo:
         gr.HTML(header)
         with gr.Row():
             with gr.Column(variant='panel', scale=5):
                 file = gr.File(label="Please upload a PDF or image", file_types=[".pdf", ".png", ".jpeg", ".jpg"])
-                max_pages = gr.Slider(1, 10, 5, step=1, label="Max convert pages")
+                max_pages = gr.Dropdown(
+                    choices=["unlimited"] + [str(i) for i in range(1, 11)],
+                    label="Max convert pages",
+                    value="5"
+                )
                 with gr.Row():
                     layout_mode = gr.Dropdown(["layoutlmv3", "doclayout_yolo"], label="Layout model", value="layoutlmv3")
                     language = gr.Dropdown(all_lang, label="Language", value="")
@@ -221,8 +365,59 @@ if __name__ == "__main__":
                     with gr.Tab("Markdown text"):
                         md_text = gr.TextArea(lines=45, show_copy_button=True)
         file.upload(fn=to_pdf, inputs=file, outputs=pdf_show)
-        change_bu.click(fn=to_markdown, inputs=[pdf_show, max_pages, is_ocr, layout_mode, formula_enable, table_enable, language],
-                        outputs=[md, md_text, output_file, pdf_show])
+        def handle_convert(pdf_file, pages, is_ocr, layout_mode, formula_enable, table_enable, language):
+            try:
+                # Check if a file is selected
+                if pdf_file is None:
+                    gr.Warning("Please select a PDF file first")
+                    return None, None, None, None
+
+                # If table recognition is enabled, ensure OCR is available
+                if table_enable:
+                    try:
+                        import rapidocr_onnxruntime
+                        from rapidocr_onnxruntime import RapidOCR
+                        import rapid_table
+                        # Force OCR on when table recognition is enabled
+                        is_ocr = True
+                    except ImportError:
+                        gr.Warning("Installing required packages for table recognition...")
+                        try:
+                            import subprocess
+                            # Install packages separately
+                            subprocess.check_call(["pip", "install", "--upgrade", "rapidocr-onnxruntime>=1.3.8"])
+                            subprocess.check_call(["pip", "install", "--upgrade", "rapid-table>=0.1.6"])
+                            subprocess.check_call(["pip", "install", "paddlepaddle"])
+                            
+                            import rapidocr_onnxruntime
+                            import rapid_table
+                        except Exception as e:
+                            logger.exception(f"Failed to install OCR packages: {str(e)}")
+                            gr.Warning("Failed to install table recognition packages. Disabling table mode.")
+                            table_enable = False
+
+                # Convert pages value
+                try:
+                    end_pages = float('inf') if pages == "unlimited" else int(pages)
+                except (ValueError, TypeError):
+                    gr.Warning("Invalid page number")
+                    return None, None, None, None
+
+                # Validate language
+                if language is None:
+                    language = ""
+
+                return to_markdown(pdf_file, end_pages, is_ocr, layout_mode, formula_enable, table_enable, language)
+            except Exception as e:
+                logger.exception(e)
+                gr.Warning(f"Error during conversion: {str(e)}")
+                return None, None, None, None
+
+        change_bu.click(
+            fn=handle_convert,
+            inputs=[pdf_show, max_pages, is_ocr, layout_mode, formula_enable, table_enable, language],
+            outputs=[md, md_text, output_file, pdf_show]
+        )
         clear_bu.add([file, md, pdf_show, md_text, output_file, is_ocr, table_enable, language])
 
     demo.launch(server_name="0.0.0.0")
