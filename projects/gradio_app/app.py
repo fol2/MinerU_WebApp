@@ -164,24 +164,19 @@ all_lang.extend([*other_lang, *latin_lang, *arabic_lang, *cyrillic_lang, *devana
 
 
 def to_pdf(file_path):
-    with pymupdf.open(file_path) as f:
+    if not file_path:
+        return None, 1
+    with pymupdf.open(file_path.name) as f:  # Changed to file_path.name
+        page_count = len(f)
         if f.is_pdf:
-            return file_path
+            return file_path.name, page_count  # Return name instead of file object
         else:
             pdf_bytes = f.convert_to_pdf()
-            # 将pdfbytes 写入到uuid.pdf中
-            # 生成唯一的文件名
             unique_filename = f'{uuid.uuid4()}.pdf'
-
-            # 构建完整的文件路径
-            tmp_file_path = os.path.join(os.path.dirname(file_path), unique_filename)
-
-            # 将字节数据写入文件
+            tmp_file_path = os.path.join(os.path.dirname(file_path.name), unique_filename)
             with open(tmp_file_path, 'wb') as tmp_pdf_file:
                 tmp_pdf_file.write(pdf_bytes)
-
-            return tmp_file_path
-
+            return tmp_file_path, page_count
 
 if __name__ == '__main__':
     with gr.Blocks() as demo:
@@ -189,7 +184,8 @@ if __name__ == '__main__':
         with gr.Row():
             with gr.Column(variant='panel', scale=5):
                 file = gr.File(label='Please upload a PDF or image', file_types=['.pdf', '.png', '.jpeg', '.jpg'])
-                max_pages = gr.Slider(1, 10, 5, step=1, label='Max convert pages')
+                page_count_state = gr.State(value=1)
+                max_pages = gr.Slider(1, 1, 1, step=1, label='Max convert pages')
                 with gr.Row():
                     layout_mode = gr.Dropdown(['layoutlmv3', 'doclayout_yolo'], label='Layout model', value='layoutlmv3')
                     language = gr.Dropdown(all_lang, label='Language', value='')
@@ -217,7 +213,16 @@ if __name__ == '__main__':
                                          latex_delimiters=latex_delimiters, line_breaks=True)
                     with gr.Tab('Markdown text'):
                         md_text = gr.TextArea(lines=45, show_copy_button=True)
-        file.upload(fn=to_pdf, inputs=file, outputs=pdf_show)
+        def update_slider(file_obj):  # Simplified function signature
+            if not file_obj:
+                return None, gr.update(maximum=1, value=1)
+            path, count = to_pdf(file_obj)
+            return path, gr.update(maximum=count, value=count)
+
+        file.upload(fn=update_slider,
+                   inputs=file,  # Changed to only take file input
+                   outputs=[pdf_show, max_pages])
+        
         change_bu.click(fn=to_markdown, inputs=[pdf_show, max_pages, is_ocr, layout_mode, formula_enable, table_enable, language],
                         outputs=[md, md_text, output_file, pdf_show])
         clear_bu.add([file, md, pdf_show, md_text, output_file, is_ocr, table_enable, language])
